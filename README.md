@@ -46,7 +46,7 @@ If you need a new namespace:
 ```kubectl create namespace eks-sample-app```
 
 Then you need to create a deployment file like this example:
-```monkey:=
+```yaml:=
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -88,7 +88,7 @@ And apply it using:
 ```kubectl apply -f {path_to_file}\{filename}.yaml```
 
 Create a service file like this:
-```monkey:=
+```yaml:=
 apiVersion: v1
 kind: Service
 metadata:
@@ -113,7 +113,7 @@ View all ressources to see if it is working:
 
 
 ## Loadbalancer
-```monkey:=
+```yaml:=
 apiVersion: v1
 kind: Service
 metadata:
@@ -128,7 +128,7 @@ spec:
       targetPort: 80
 ```
 ## Nodeport
-```monkey:=
+```yaml:=
 apiVersion: v1
 kind: Service
 metadata:
@@ -145,7 +145,7 @@ spec:
 
 
 ## Ingress
-```monkey:=
+```yaml:=
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -338,4 +338,197 @@ We started looking at how helm charts are created, but this seemed like a big ta
 
 We could not deploy Argo with terraform, but we could deploy it using the helm cli tool. We could however not get access to the cluster, which might be because of some ingress shenenasdnfas.
 
+
+Installing via Helm CLI:
+1. `helm repo add bitnami https://charts.bitnami.com/bitnami`
+2. `helm repo update`
+3. `helm install bitnami/bitnami/argo-workflows --generate-name`
+
+Continues in week 5
+
 # Week 5
+## Argo Workflows continued
+
+Portforward:
+`kubectl port-forward --namespace default svc/argo-wf-argo-workflows-server 8080:80 & echo "Argo Workflows UI URL: http://127.0.0.1:8080/"`
+
+This however results in an error:
+```
+Forwarding from 127.0.0.1:8080 -> 2746
+Forwarding from [::1]:8080 -> 2746
+Handling connection for 8080
+E0129 12:11:24.456670   18812 portforward.go:409] an error occurred forwarding 8080 -> 2746: error forwarding port 2746 to pod bc8f38250fa892fa902cb2f30081e02e332e02e92285c596ad7e79808f8bd543, uid : failed to execute portforward in network namespace "/var/run/netns/cni-235c801b-301d-1f7e-6d22-5428662d976e": failed to connect to localhost:2746 inside namespace "bc8f38250fa892fa902cb2f30081e02e332e02e92285c596ad7e79808f8bd543", IPv4: dial tcp4 127.0.0.1:2746: connect: connection refused IPv6 dial tcp6: address localhost: no suitable address found
+error: lost connection to pod
+```
+which we think? might be caused by kubectl using the wrong port when forwarding???
+This was not the case, since we found out the problem was with the argo postgres pod. The 2 argo pods depends on the argo postgres pod, so they wont work until the postgres pod is working.
+The problem with the postgres pod was that it would not start up since it was missing a volume to bind to. The automatic bind would not work, since the driver (aws-ebs-csi-driver ) for programatically creating / binding volumes in aws is disabled by default. We added it to the cluster_addons, and now the postgres pod started.
+
+```
+# Needed by the aws-ebs-csi-driver
+iam_role_additional_policies = {
+  AmazonEBSCSIDriverPolicy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+}
+```
+
+After the postgres pod was running, the 2 argo pods started succesfully after a reboot.
+Now the portforwarding worked, and we could go to the argo workflows homepage.
+
+We were not authorized to do anything so we started looking at Ingress / alb Loadbalancing.
+
+## Ingress
+Deployment of k8s ingress failed due to this error message:
+```
+Warning  FailedBuildModel  12m  ingress  Failed build model due to WebIdentityErr: failed to retrieve credentials
+caused by: ValidationError: Request ARN is invalid
+```
+
+Hoping for a solution from this [aws article](https://repost.aws/knowledge-center/eks-load-balancer-webidentityerr) that says it's related to service accounts
+
+These links fixed this error:
+https://stackoverflow.com/questions/66405794/not-authorized-to-perform-stsassumerolewithwebidentity-403
+https://docs.aws.amazon.com/eks/latest/userguide/associate-service-account-role.html
+
+We changed the trust policy for the praktikant role to include "sts:AssumeRoleWithWebIdentity", and it fixed this problem.
+```json=
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::851725286774:role/aws-reserved/sso.amazonaws.com/eu-north-1/AWSReservedSSO_Contributor_14bf02704449cc6b",
+                "Service": "eks.amazonaws.com"
+            },
+            "Action": [
+                "sts:AssumeRole"
+            ]
+        },
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "AWS": "arn:aws:iam::851725286774:role/aws-reserved/sso.amazonaws.com/eu-north-1/AWSReservedSSO_Contributor_14bf02704449cc6b",
+                "Service": "eks.amazonaws.com"
+            },
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {
+                "StringEquals": {
+                    "oidc.eks.eu-north-1.amazonaws.com/id/4311742964249D15EB5FBF28832B42C4:sub": "system:serviceaccount:default:argo-wf-argo-workflows-server"
+                }
+            }
+        }
+    ]
+}
+```
+
+We came to the conclusion that we had no idea what to do, and even if the ingress controller was deployed correctly.
+
+We started following this guide:
+https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html
+
+Step-by-step:
+```
+curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.5.4/docs/install/iam_policy.json
+```
+```
+aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam_policy.json
+```
+Be careful about using override as it overwrites existing roles
+```
+eksctl create iamserviceaccount --cluster=argo-wf-cluster --namespace=kube-system --name=aws-load-balancer-controller --role-name AmazonEKSLoadBalancerControllerRole --attach-policy-arn=arn:aws:iam::851725286774:policy/AWSLoadBalancerControllerIAMPolicy --approve --override-existing-serviceaccounts
+```
+
+```
+helm repo add eks https://aws.github.io/eks-charts
+```
+
+```
+helm repo update eks
+```
+
+```
+helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system --set clusterName=argo-wf-cluster --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller
+```
+
+To check if the load-balancers are working
+```
+kubectl get deployment -n kube-system aws-load-balancer-controller
+```
+
+It worked and outputtet an "official" url which we could use to access the argo workflow home page. (we also created a serviceaccount for ingress but we don't know if it had any impact).
+We still need to set up authentication for it.
+
+We discovered how to deploy helm charts with custom values. By using the command `helm upgrade -f values.yaml argo-wf argo-workflows-6.3.1.tar.gz` we can inject custom values into the chart before deploying. Remember to restart the pods afterwards to see the changes.
+
+**If deleting ingress does not work, check if a finalizer exists as they might stop the deletion process.**
+
+Next steps:
+* Use helm provider to deploy load balancer via terraform
+* Use helm provider to deploy ingress.yaml via terraform
+* Find out how to deploy argo-workflow with terraform
+* * Find out how to get argo-workflow setup with sso login
+* Deploy to terraform cloud and create a new releas v0.2alpha
+
+Getting the load balancer to work in terraform proved to be a difficult task.
+
+We were succesfull in creating the necessary service account, but getting the load balancer to work did not happen - We also added service account creation for ALB in the terraform code.
+We started by usinf the "aws_lb" which created a load balancer, but found out after a lot of testing, that it only created a blank load balancer, with nothing configured at all.
+This "module" could definitely work, but required much knowledge about how to create a load balancer from scratch where EVERYTHING need to be manually created.
+
+We finally got it to work with:
+```=
+resource "helm_release" "load_balancer_controller" {
+  name       = "tf"
+  repository = "https://aws.github.io/eks-charts"
+  chart      = "aws-load-balancer-controller"
+  namespace = "kube-system"
+
+  set {
+    name = "clusterName"
+    value="argo-wf-cluster"
+  }
+  set {
+    name = "serviceAccount.create"
+    value="false"
+  }
+  set {
+    name = "serviceAccount.name"
+    value="tf-aws-load-balancer-controller"
+  }
+}
+```
+since the only thing missing was to actually "bind" the service account the the load balancer. This module also created everything for us so we did not need to configure much.
+
+We then got ingress to work in terraform, by using the "kubernetes_manifest" ressource, and using yamldecode(ingress.yaml):
+```hcl=
+resource "kubernetes_manifest" "ingress-manifest" {
+  manifest   = yamldecode(file("../ingress.yaml"))
+  depends_on = [kubernetes_namespace.argo]
+}
+```
+
+We discovered that the "kubernetes_manifest" resource contacts the kubernetes api when it is trying to create. This however will never work on a clean cluster install, as terraform does not know that that dependency exists, so it fails.
+We tried "kubectl_manifest" instead: https://registry.terraform.io/providers/gavinbunney/kubectl/latest/docs
+And it worked, and is also tracked in terraform.
+
+Now we just need to get argo workflows to work, and we can try to deploy in tfcloud and create a new release: v0.2alpha.
+
+We now were facing a problem with terraform destroy. Because of some dependencies that terraform does not know about, it cannot delete an object that other objects depend on:
+* The VPC cannot be destroyed because it depends on the subnets
+* The subnets connot be destroyed because they depend on the ALB
+* The ALB cannot be destroyed since terraform does not know it exists
+
+We think that because we deploy the ALB with a helm chart in terraform, it creates some ressources that terraform does not track in the state. So when we run terraform destroy, it will fail.
+
+<span style="color:red">**[Short term fix]**</span>
+What to do to make terraform destroy work:
+* Manually destroy the load balancer in aws
+* Manually destroy the subnets in aws
+* Manually destroy the security groups
+
+# Week 6 
+
+We started the week by assembling Ikea furniture.
+
+
+## Moving back to tfcloud
