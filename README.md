@@ -528,7 +528,81 @@ What to do to make terraform destroy work:
 
 # Week 6 
 
-We started the week by assembling Ikea furniture.
+## <span style="color:darkblue">**Ikea**</span>
+We started the week by assembling Ikea furniture. We assembled noice cancelleres which were to be placed on the tables, as the room we work in has bad accoustics. The product was the eilif:
+https://www.ikea.com/dk/da/p/eilif-skaerm-til-skrivebord-gra-00466937/
+We were assigned this role since we were waiting for other tasks to be ready. It was a role which we knew we had the right experience to fulfill, so we were happy to oblige. It did not take long deploying the noice cancellers to the tables, but we soon realized that there were ordered too few of them. This was not a critical problem, but it was a setback nonetheless. We tried using root cause analysis, to figure out what happened and where it went wrong but to no avail. We held a meeting afterwards to discuss the current state of the situation and we came to the conclusion that there needed to be ordered some more noice cancellers so all the tables could be covered. This is especially important as each person is equal, so the people who are missing the noice cancellers, might feel left out - which is definitely not a good situation to be in. Be it for the victim or the workplace. We don't want to create a hostile working environment as that can have fatal effects on the company.
 
+
+## Misc
+We tried destroying the cluster, but ran into new problems. Now the argo namespace was stuck terminating endlessly and caused the terraform destroy to fail.
+
+After deploying the cluster again, we ran into a new problem we never have seen before.
+For some reason the argo pods could not start at all, and output an error with postgres user. We don't know what causes this.
+Somehow deploying argo in the default namespace, fixed this error, and we can now try to progress again.
+Disabling auth works.
+Deploying argo in a namespace that is not the "argo" namespace works.
+
+## Argo
+We found out how to login to argo workflows. We set the auth mode to client which takes a kubernetes bearer token as input. We followed this guide:
+https://argo-workflows.readthedocs.io/en/latest/access-token/
+
+We could now login but did not have access to creating workflows and such. After a couple of hours we found out that a magic string with the value "argo" was actually the namespace the service account would "work" in. We did not notice and assumed it was to specify the argo deployment.
+After changing this to the actual namespace it worked.
+
+**Full step by step (with the name argo-client)**
+argo-client-role.yaml:
+```yaml=
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: workflows
+  name: argo-client
+rules:
+- apiGroups:
+    - argoproj.io
+  resources:
+      - pods
+      - workflows
+      - workflows/finalizers
+      - cronworkflows
+      - cronworkflows/finalizers
+      - workfloweventbindings
+      - workfloweventbindings/finalizers
+      - workflowtaskresults
+      - workflowtaskresults/finalizers
+      - workflowtasksets
+      - workflowtasksets/finalizers
+      - workflowtasksets/status
+      - workflowtemplates
+      - workflowtemplates/finalizers  
+      - eventsources
+      - sensors
+  verbs: ["get", "watch", "list"]
+```
+Cli commands to deploy:
+```
+kubectl create role argo-client --verb=list,update --resource=workflows.argoproj.
+io -n workflows
+
+kubectl create sa argo-client -n workflows
+
+kubectl create rolebinding argo-client --role=argo-client --serviceaccount=argo:workflows-client -n workflows
+
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  namespace: workflows
+  name: argo-client.service-account-token
+  annotations:
+    kubernetes.io/service-account.name: argo-client
+type: kubernetes.io/service-account-token
+EOF
+
+ARGO_TOKEN="Bearer $(kubectl get -n workflows secret argo-client.service-account-token -o=jsonpath='{.data.token}' | base64 --decode)"
+
+echo $ARGO_TOKEN
+```
 
 ## Moving back to tfcloud
