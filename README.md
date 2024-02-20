@@ -1,4 +1,6 @@
 # Tech Chapter Log / Guide
+This document details our experiences during the internship, and includes both technical notes and also in general the things we are working on. It describes some of the problems we encountered and how we tried to fix them.
+
 [TOC]
 
 # Week 1 Kubernetes in AWS & signed commits
@@ -18,9 +20,6 @@ https://docs.aws.amazon.com/eks/latest/userguide/add-user-role.html
 It may be required to use the ```--profile {user}``` flag in case the default profile does not have access to AWS.
 
 It may be required to use the ```-n {namespace}``` flag in case the "objects" you are trying to interact with are in a different namespace.
-
-## Important folders and files
-
 
 ## Cluster
 There are two ways to deploy a cluster: using the AWS Management Console (GUI) or the commandline.
@@ -233,11 +232,11 @@ https://argo-workflows.readthedocs.io/en/latest/quick-start/
 Download the exe and add to Windows Path:
 https://github.com/argoproj/argo-workflows/releases/tag/v3.5.2
 
-```m=
+```
 kubectl create namespace argo
 ```
 
-```m=
+```!
 kubectl patch deployment argo-server --namespace argo --type='json' -p='[{"op": "replace", "path": "/spec/template/spec/containers/0/args", "value": ["server", "--auth-mode=server"]}]
 ```
 
@@ -353,7 +352,7 @@ Portforward:
 `kubectl port-forward --namespace default svc/argo-wf-argo-workflows-server 8080:80 & echo "Argo Workflows UI URL: http://127.0.0.1:8080/"`
 
 This however results in an error:
-```
+```!
 Forwarding from 127.0.0.1:8080 -> 2746
 Forwarding from [::1]:8080 -> 2746
 Handling connection for 8080
@@ -364,7 +363,7 @@ which we think? might be caused by kubectl using the wrong port when forwarding?
 This was not the case, since we found out the problem was with the argo postgres pod. The 2 argo pods depends on the argo postgres pod, so they wont work until the postgres pod is working.
 The problem with the postgres pod was that it would not start up since it was missing a volume to bind to. The automatic bind would not work, since the driver (aws-ebs-csi-driver ) for programatically creating / binding volumes in aws is disabled by default. We added it to the cluster_addons, and now the postgres pod started.
 
-```
+```!
 # Needed by the aws-ebs-csi-driver
 iam_role_additional_policies = {
   AmazonEBSCSIDriverPolicy = "arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
@@ -378,7 +377,7 @@ We were not authorized to do anything so we started looking at Ingress / alb Loa
 
 ## Ingress
 Deployment of k8s ingress failed due to this error message:
-```
+```!
 Warning  FailedBuildModel  12m  ingress  Failed build model due to WebIdentityErr: failed to retrieve credentials
 caused by: ValidationError: Request ARN is invalid
 ```
@@ -390,7 +389,7 @@ https://stackoverflow.com/questions/66405794/not-authorized-to-perform-stsassume
 https://docs.aws.amazon.com/eks/latest/userguide/associate-service-account-role.html
 
 We changed the trust policy for the praktikant role to include "sts:AssumeRoleWithWebIdentity", and it fixed this problem.
-```json=
+```json!
 {
     "Version": "2012-10-17",
     "Statement": [
@@ -427,14 +426,14 @@ We started following this guide:
 https://docs.aws.amazon.com/eks/latest/userguide/aws-load-balancer-controller.html
 
 Step-by-step:
-```
+```!
 curl -O https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.5.4/docs/install/iam_policy.json
 ```
-```
+```!
 aws iam create-policy --policy-name AWSLoadBalancerControllerIAMPolicy --policy-document file://iam_policy.json
 ```
 Be careful about using override as it overwrites existing roles
-```
+```!
 eksctl create iamserviceaccount --cluster=argo-wf-cluster --namespace=kube-system --name=aws-load-balancer-controller --role-name AmazonEKSLoadBalancerControllerRole --attach-policy-arn=arn:aws:iam::851725286774:policy/AWSLoadBalancerControllerIAMPolicy --approve --override-existing-serviceaccounts
 ```
 
@@ -446,7 +445,7 @@ helm repo add eks https://aws.github.io/eks-charts
 helm repo update eks
 ```
 
-```
+```!
 helm install aws-load-balancer-controller eks/aws-load-balancer-controller -n kube-system --set clusterName=argo-wf-cluster --set serviceAccount.create=false --set serviceAccount.name=aws-load-balancer-controller
 ```
 
@@ -534,7 +533,7 @@ https://www.ikea.com/dk/da/p/eilif-skaerm-til-skrivebord-gra-00466937/
 We were assigned this role since we were waiting for other tasks to be ready. It was a role which we knew we had the right experience to fulfill, so we were happy to oblige. It did not take long deploying the noice cancellers to the tables, but we soon realized that there were ordered too few of them. This was not a critical problem, but it was a setback nonetheless. We tried using root cause analysis, to figure out what happened and where it went wrong but to no avail. We held a meeting afterwards to discuss the current state of the situation and we came to the conclusion that there needed to be ordered some more noice cancellers so all the tables could be covered. This is especially important as each person is equal, so the people who are missing the noice cancellers, might feel left out - which is definitely not a good situation to be in. Be it for the victim or the workplace. We don't want to create a hostile working environment as that can have fatal effects on the company.
 
 
-## Misc
+## Problem with "corrupted" namespace
 We tried destroying the cluster, but ran into new problems. Now the argo namespace was stuck terminating endlessly and caused the terraform destroy to fail.
 
 After deploying the cluster again, we ran into a new problem we never have seen before.
@@ -581,14 +580,14 @@ rules:
   verbs: ["get", "watch", "list"]
 ```
 Cli commands to deploy:
-```
-kubectl create role argo-client --verb=list,update --resource=workflows.argoproj.
-io -n workflows
+```yaml!
+~~kubectl create role argo-client --verb=list,update --resource=workflows.argoproj.io -n workflows~~
 
 kubectl create sa argo-client -n workflows
 
-kubectl create rolebinding argo-client --role=argo-client --serviceaccount=argo:workflows-client -n workflows
-
+kubectl create rolebinding argo-client --role=argo-client --serviceaccount=workflows:argo-client -n workflows
+```
+```yaml!
 kubectl apply -f - <<EOF
 apiVersion: v1
 kind: Secret
@@ -599,10 +598,139 @@ metadata:
     kubernetes.io/service-account.name: argo-client
 type: kubernetes.io/service-account-token
 EOF
-
+```
+```!
 ARGO_TOKEN="Bearer $(kubectl get -n workflows secret argo-client.service-account-token -o=jsonpath='{.data.token}' | base64 --decode)"
 
 echo $ARGO_TOKEN
 ```
 
 ## Moving back to tfcloud
+
+As usual we had problems moving from s3 bucket to the tfcloud backend. We think it is bacause tfcloud still has a state. It tries to apply out changes but says there are drifts with many resources. It ultimately fails when it tries to contact the kubernetes cluster and cannot reach it - which it can't since it does not exist.
+
+We do not have permissions to operations like destroy so we were kind of deadlocked - until the admin helped us.
+
+We destroyed the cluster and deployed it to tfcloud. Most of the deployment was fine but we got the same issue when it came to the helm release:
+```!
+Error: Kubernetes cluster unreachable: Get "https://9D78EC50BBB1275595721A6EF091F4DA.gr7.eu-north-1.eks.amazonaws.com/version": getting credentials: exec: executable aws failed with exit code 255
+with helm_release.argo_wf
+on helm.tf line 13, in resource "helm_release" "argo_wf":
+resource "helm_release" "argo_wf" {
+```
+We discovered that the problem was with the helm provider which looked like this:
+```!
+provider "helm" {
+  kubernetes {
+    host                   = data.aws_eks_cluster.cluster.endpoint
+    cluster_ca_certificate = base64decode(data.aws_eks_cluster.cluster.certificate_authority.0.data)
+    exec {
+      api_version = "client.authentication.k8s.io/v1beta1"
+      args        = ["eks", "get-token", "--cluster-name", data.aws_eks_cluster.cluster.name]
+      command     = "aws"
+    }
+  }
+}
+```
+
+We assumed that since deployment worked with an s3 backend, it would also work in tfcloud, but the problem was with the exec statement in the helm provider.
+It works fine when deploying with the cli since we have the aws-cli installed, but tfcloud does not, so it cannot run the command and will not get credentials to deploy helm releases.
+
+After changing it to the same credentials as the kubernets provider it worked.
+Now the only thing that fails in a full tfcloud deployment is the kubectl_manifest that deploys the ingress for argo.
+
+This was because we did not explicitly create the kubectl provider, so it used default values which was using local resources - which is why it only worked on the s3 bucket.
+The provider was identical to the helm provider with credentials, and we added "a "load_config_file = false", and it worked.
+
+We now have a fully working cluster that is deployed only using terraform with argo workflows.
+
+The only missing thing is making the service account and getting the kubernetes bearer token for the argo login, but we are doing that manually for now.
+
+## Argo Workflows
+
+We started by deploying the standard hello world image from docker.
+We got a basic workflow for posting slack messages working. We used a slack template, and made a workflow that calls the template.
+
+We discovered how to make workflows eventbased by creating a WorkflowEventBinding which exposes a url to access (fx with curl). This means that we can now start up workflows using http request so that we do not have to submit them with the cli.
+
+We made it work and are now able to send messages to our slack test server.
+Just remember to setup webhook and add the bot and such.
+
+We planned taking the next week off from work (we might work from home some of the time), so we did not have a lot of time before the break, so we started researching some other topics.
+
+Michael started looking at how you can deploy workflows with python, and Sebastian tried to create a pod that can run kubectl commands, to refresh bearer tokens.
+
+Kubernetes bearer token yaml file
+* Update the patch line to work
+* Refresh / revoke the token and make a new one
+* Make a cronjob that does the same instead of a deployment
+
+This idea was put on the shelf as there must be a better way to do this, and that it isn't really important now, since we can just use hardcoded values (even though it should be changed in a real product).
+
+# Week 7
+We did not do much this week as we took a break and only worked a couple hours here and there.
+We started looking at creating github actions. We wanted to create a simple action that triggered on pull requests, and then called the argo api which then started the slack notify workflow to send a message to slack about who created the pull request.
+
+```!=
+name: slack-notify-pull-pull-request
+run-name: ${{ github.actor }} created a pull request
+
+on: [pull_request]
+jobs:
+  check-bats-version:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl --request POST \
+          --header 'Authorization: ${{ secrets.argotoken }}' \
+          --header 'X-Argo-E2E: true' \
+          --header 'Content-Type: application/json' \
+          --url ${{ secrets.argourl }} \
+          --data '{"message": "${{ github.actor }} made a pull-request, please can anyone review?", "channel": "hh-more-spam-please"}'
+
+```
+
+# Week 8 argo workflows
+
+We started looking at how to create workflows that have multiple steps to complete. An example of this is the below workflow that sends a message to a channel in both steps:
+```yaml=
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: send-to-multiple-slack-channels
+spec:
+  ttlStrategy:
+    secondsAfterSuccess: 10
+  entrypoint: send-messages
+  arguments:
+    parameters:
+    - name: outer-message
+      value: Message to send
+  templates:
+  - name: send-messages
+    steps:
+    - - name: template-run1
+        templateRef:
+          name: slack
+          template: notify
+        arguments:
+          parameters:
+            - name: message
+              value: "{{workflow.parameters.outer-message}}"
+            - name: channel
+              value: "hh-even-more-spam"
+    - - name: template-run2
+        templateRef:
+          name: slack
+          template: notify
+        arguments:
+          parameters:
+            - name: message
+              value: "{{workflow.parameters.outer-message}}"
+            - name: channel
+              value: "hh-more-spam-please"
+```
+
+## Automating deployment of workflow templates using github actions
+Next step was to try to figure out how to deploy workflows without doing it manually.
+The idea was to have a workflows folder in the github repo, and then when a workflow file was added / modified / deleted, it would trigger a github action that would deploy / remove the workflow from argo workflows.
