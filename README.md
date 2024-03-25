@@ -689,6 +689,12 @@ jobs:
           --data '{"message": "${{ github.actor }} made a pull-request, please can anyone review?", "channel": "hh-more-spam-please"}'
 
 ```
+## Github CLI
+In order to manage secrets stored at github, we needed a tool, since we can't manage secrets through githubs UI.
+With Github CLI we are able to create and update secrets, on repositories where we have the collaborator role.
+The secrets are being interpolated into the workflows template as you may have noticed in the section above:
+```--header 'Authorization: ${{ secrets.argotoken }}'``` this reads the github secret called _argotoken_ and inserts then in hte correct spots.
+
 
 # Week 8 argo workflows
 
@@ -734,3 +740,99 @@ spec:
 ## Automating deployment of workflow templates using github actions
 Next step was to try to figure out how to deploy workflows without doing it manually.
 The idea was to have a workflows folder in the github repo, and then when a workflow file was added / modified / deleted, it would trigger a github action that would deploy / remove the workflow from argo workflows.
+
+### Problems with argo cli vs curl for templates
+When sending http requests the request body needs to be wrapped inside a "template" object, which is strictly the opposite of how it is written in the yaml file using the cli. In the yaml file the template wrapping is not written. So depending on whether you use curl or the cli you need to include / exclude the template object.
+This is annoying af and we spent 2 hours trying to find a solution.
+
+For this to work we need to make a "translator" that first transforms the yaml to json using yq and then wraps the object in a "template" object, before it sends the request.
+
+### Error
+{"code":3,"message":"workflowtemplates.argoproj.io \"modifyplease\" is invalid: metadata.resourceVersion: Invalid value: 0x0: must be specified for an update"}
+
+```yaml=
+name: updating
+run: |
+    arr=(${{steps.get_changes.outputs.modified}})
+          for filepath in "${arr[@]}"
+            do
+              file_revision=$(git rev-list --max-count=1 --all -- ./"$filepath")
+              git show "$file_revision"^:$filepath > removed_file_content.yaml
+              template_name=$(yq '.metadata.name' removed_file_content.yaml)
+              curl -X DELETE -H "Authorization: $argo_token" "$argo_url"/"$template_name"
+              json=$(yq ./"$filepath" -o json)
+              payload={\"template\":$json}
+              curl -X POST -H "Authorization: $argo_token" -H "Content-Type: application/json" -d "$payload" $argo_url
+            done
+```
+
+It looks like it is not too happy about using the put request, so we tried doing it the "hard" way, by deleting the template and then creating it again.
+
+It worked when we deleted the template first and then added it afterwards.
+There might however be a problem with how the checkout plugin checks for modified files. Sometimes when new files are added, they count as modified instead of created. This might be because deleting and creating a new file with the same data counts as modifying a file rather than deleting an old file and also creating a new file.
+
+We think we got it to work - or the cases we have tested worked.
+
+## Automated testing
+The next task was to create a testing environment to test the deployment of workflow templates.
+
+To test if a workflowtemplate was deployed and worked we needed a way to access it. The easiest way to do this is with an eventbinding that takes a payload and then calls the workflowtemplate.
+We decided to include an optional metadata field "discriminator" in the templates that when included creates a corrosponding eventbinding that can be curled.
+
+When testing the tests will check if an eventbinding exists and use it, and if it does not exist create a temporary eventbinding to test the workflowtemplate and then delete the eventbinding afterwards.
+
+### Getting access to the cluster inside github action
+We decided instead to create an eventbinding in argo workflows to apply kubernets manifests.
+
+# Week 9
+
+## Problems with the argo workflow authentication setup
+When applying a kubernetes manifest inside an argo workflows workflow this error occurs:
+```!
+Error from server (Forbidden): error when retrieving current configuration of:
+Resource: "argoproj.io/v1alpha1, Resource=workfloweventbindings", GroupVersionKind: "argoproj.io/v1alpha1, Kind=WorkflowEventBinding"
+Name: "eventbinding-from-kubectl-template", Namespace: "workflows"
+from server for: "STDIN": workfloweventbindings.argoproj.io "eventbinding-from-kubectl-template" is forbidden: User "system:serviceaccount:workflows:default" cannot get resource "workfloweventbindings" in API group "argoproj.io" in the namespace "workflows"
+time="2024-02-26T11:44:02.406Z" level=info msg="sub-process exited" argo=true error="<nil>"
+Error: exit status 1
+```
+This indicates that we might have used a default serviceaccount instead of the argo-client serviceaccount we have created. Reading our terraform configurations confirms this suspicion. It is only the loadbalancer that we have specified to use a serviceaccount we manage in terraform. The argo workflows serviceaccount is created manually which means that when terraform creates the argo resource it uses the default serviceaccount.
+This is a case where something worked, but we misunderstood why. We thought that when we created the argo-client serviceaccount to get the bearer token, that it was using it inside argo workflows. This was not the case since you can use any serviceaccounts bearer token for authentication.
+
+It is not possible to change serviceaccount inside a pod when it is already running. You can in a deployment however, but it will just redeploy the pods.
+Since argo always needs to run this is not really something we can do easily. We also have to change this inside terraform as to not create drifts - and also since the setup is flawed as to when we redeploy the cluster, it will just use the default serviceaccount since nothing else is specified.
+
+The proposed theory behind why it does not work was almost true. It was not a problem with the argo workflows serviceaccount. When argo workflows creates a container (pod) it uses the default serviceaccount, so the problem is with the pods themselves.
+
+**To specify the serviceaccount a pod should use, you add the serviceaccount to the specs of the workflow/template.**
+
+### Deploying events
+* Python script to populate eventbinding template
+* Image with above python script
+* Output from the python script is in kubernetes manifest form, so that is the applied
+
+## Problems with AWS availability zones and volumes
+```!
+0/2 nodes are available: 2 node(s) had volume node affinity conflict. preemption: 0/2 nodes are available: 2 Preemption is not helpful for scheduling..
+```
+The volume was mounted on the 1b zone but the 2 worker nodes restarted and were created in the 1a and 1c zones, which meant that the argo database did not have access to the volume, since volumes are not cross-zone and the Argo pods had no node to run on in 1b.
+
+We changed the node count from 2 to 3 to guarantee that there will always be a node in the 1b zone.
+We tried to change the nodeaffinity to force argo to run in 1b by changing the values file for the helm chart:
+https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/
+
+We don't know if this worked, but having 3 nodes solves the problem for non-edge cases.
+
+We later found out that the nodegroup does not autoscale correctly and ended up having 1 note in 1a and 2 notes in 1c.
+
+### SideNote
+We originally chose 2 nodes since the Core-DNS addon for the cluster requires at least 2.
+
+## CSGO
+On Friday this week the whole company gathered at the HQ in Copenhagen. This was a standard status meeting for the business, but no one was there for that. The reason why people came was because there would be held a tournament in CSGO afterwards. We lost so this topic will be discussed no further.
+
+# Week 10 Argo continued and pushing images to ECR
+
+We spend 3 hours trying to figure out why argo curl requests returned a Code:13 error even though the workflows were triggered and ran to completion.
+We found out that one of the eventbindings had invalid syntax since dashes are not allowed for parameters. This resulted in all argo eventbindings not returning Ok(200) which could have big impact when testing or such.
+So 1 invalid yaml file that is uploaded to argo workflows can cripple the whole deployment.
